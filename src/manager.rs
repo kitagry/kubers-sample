@@ -1,6 +1,9 @@
 use crate::Error;
 use futures::{future::BoxFuture, FutureExt, StreamExt};
-use kube::{api::ListParams, Api, Client, CustomResource};
+use k8s_openapi::api::core::v1::{Container, Pod, PodSpec};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+use kube::api::{DeleteParams, ListParams, PostParams};
+use kube::{Api, Client, CustomResource};
 use kube_runtime::{
     controller::{Context, ReconcilerAction},
     Controller,
@@ -8,9 +11,7 @@ use kube_runtime::{
 use prometheus::{default_registry, proto::MetricFamily};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::RwLock;
 
 #[derive(CustomResource, Deserialize, Serialize, Clone, Debug, JsonSchema)]
 #[kube(
@@ -30,34 +31,75 @@ struct Data {
     client: Client,
 }
 
-async fn reconcile(_job: Job, _ctx: Context<Data>) -> Result<ReconcilerAction, Error> {
+async fn reconcile(job: Job, ctx: Context<Data>) -> Result<ReconcilerAction, Error> {
+    println!("{:?}", job);
+    let pods = Api::<Pod>::namespaced(
+        ctx.get_ref().client.clone(),
+        &job.metadata.namespace.as_ref().unwrap(),
+    );
+
+    match pods.get(&job.spec.name).await {
+        Ok(pod) => {
+            let container = &pod.spec.unwrap().containers[0];
+            if container.name == job.spec.name
+                && container.image.as_ref().unwrap() == &job.spec.image
+            {
+                return Ok(ReconcilerAction {
+                    requeue_after: None,
+                });
+            }
+            let dp = DeleteParams::default();
+            pods.delete(&pod.metadata.name.unwrap(), &dp)
+                .await
+                .or_else(|e| Err(Error::KubeError(e)))?;
+            create_pod(pods, job).await?;
+        }
+        Err(kube::Error::Api(e)) if e.code == 404 => {
+            create_pod(pods, job).await?;
+        }
+        Err(e) => return Err(Error::KubeError(e)),
+    };
     Ok(ReconcilerAction {
         requeue_after: None,
     })
 }
 
-fn error_policy(_errorr: &Error, _ctx: Context<Data>) -> ReconcilerAction {
-    ReconcilerAction {
-        requeue_after: Some(Duration::from_secs(360)),
+async fn create_pod(pods: Api<Pod>, job: Job) -> Result<(), Error> {
+    let pod = Pod {
+        metadata: ObjectMeta {
+            namespace: job.metadata.namespace.clone(),
+            name: job.metadata.name.clone(),
+            ..Default::default()
+        },
+        spec: Some(PodSpec {
+            containers: vec![Container {
+                name: job.spec.name,
+                image: Some(job.spec.image),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }),
+        status: None,
+    };
+    let pp = PostParams::default();
+    match pods.create(&pp, &pod).await {
+        Ok(_) => Ok(()),
+        Err(e) => Err(Error::KubeError(e)),
     }
 }
 
-#[derive(Clone, Serialize)]
-pub struct State {}
-
-impl State {
-    fn new() -> Self {
-        Self {}
+fn error_policy(error: &Error, _ctx: Context<Data>) -> ReconcilerAction {
+    println!("reconcile failed: {:?}", error);
+    ReconcilerAction {
+        requeue_after: Some(Duration::from_secs(360)),
     }
 }
 
 /// Data owned by the Manager
 #[derive(Clone)]
 pub struct Manager {
-    /// In memory state
-    state: Arc<RwLock<State>>,
     // Various prometheus metrics
-    // metrics: Metrics,
+// metrics: Metrics,
 }
 
 impl Manager {
@@ -66,7 +108,6 @@ impl Manager {
         let context = Context::new(Data {
             client: client.clone(),
         });
-        let state = Arc::new(RwLock::new(State::new()));
 
         let jobs = Api::<Job>::all(client);
         let _r = jobs.list(&ListParams::default().limit(1)).await.expect(
@@ -80,14 +121,10 @@ impl Manager {
             .for_each(|_| futures::future::ready(()))
             .boxed();
 
-        (Self { state }, drainer)
+        (Self {}, drainer)
     }
 
     pub fn metrics(&self) -> Vec<MetricFamily> {
         default_registry().gather()
-    }
-
-    pub async fn state(&self) -> State {
-        self.state.read().await.clone()
     }
 }

@@ -19,12 +19,6 @@ async fn health(_: HttpRequest) -> impl Responder {
     HttpResponse::Ok().json("healthz")
 }
 
-#[get("/")]
-async fn index(c: Data<Manager>, _req: HttpRequest) -> impl Responder {
-    let state = c.state().await;
-    HttpResponse::Ok().json(&state)
-}
-
 #[actix_rt::main]
 async fn main() -> Result<()> {
     let (manager, drainer) = Manager::new().await;
@@ -33,7 +27,6 @@ async fn main() -> Result<()> {
         App::new()
             .app_data(Data::new(manager.clone()))
             .wrap(middleware::Logger::default().exclude("/health"))
-            .service(index)
             .service(health)
             .service(metrics)
     })

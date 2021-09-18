@@ -1,0 +1,7 @@
+apiVersion: kitagry.github.io/v1beta1
+kind: Job
+metadata:
+  name: sample
+spec:
+  name: test
+  image: nginx
