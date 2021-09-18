@@ -1,14 +1,16 @@
 use crate::Error;
 use futures::{future::BoxFuture, FutureExt, StreamExt};
 use k8s_openapi::api::core::v1::{Container, Pod, PodSpec};
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, OwnerReference};
 use kube::api::{DeleteParams, ListParams, PostParams};
-use kube::{Api, Client, CustomResource};
+use kube::{Api, Client, CustomResource, Resource};
 use kube_runtime::{
     controller::{Context, ReconcilerAction},
     Controller,
 };
 use prometheus::{default_registry, proto::MetricFamily};
+use rand::distributions::Alphanumeric;
+use rand::{thread_rng, Rng};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -38,20 +40,23 @@ async fn reconcile(job: Job, ctx: Context<Data>) -> Result<ReconcilerAction, Err
         &job.metadata.namespace.as_ref().unwrap(),
     );
 
-    match pods.get(&job.spec.name).await {
-        Ok(pod) => {
-            let container = &pod.spec.unwrap().containers[0];
-            if container.name == job.spec.name
-                && container.image.as_ref().unwrap() == &job.spec.image
-            {
-                return Ok(ReconcilerAction {
-                    requeue_after: None,
-                });
+    let lp = ListParams::default();
+    match pods.list(&lp).await {
+        Ok(pod_list) => {
+            for pod in pod_list {
+                let container = &pod.spec.unwrap().containers[0];
+                if container.name == job.spec.name
+                    && container.image.as_ref().unwrap() == &job.spec.image
+                {
+                    return Ok(ReconcilerAction {
+                        requeue_after: None,
+                    });
+                }
+                let dp = DeleteParams::default();
+                pods.delete(&pod.metadata.name.unwrap(), &dp)
+                    .await
+                    .or_else(|e| Err(Error::KubeError(e)))?;
             }
-            let dp = DeleteParams::default();
-            pods.delete(&pod.metadata.name.unwrap(), &dp)
-                .await
-                .or_else(|e| Err(Error::KubeError(e)))?;
             create_pod(pods, job).await?;
         }
         Err(kube::Error::Api(e)) if e.code == 404 => {
@@ -64,11 +69,28 @@ async fn reconcile(job: Job, ctx: Context<Data>) -> Result<ReconcilerAction, Err
     })
 }
 
+fn object_to_owner_reference<K: Resource<DynamicType = ()>>(
+    meta: ObjectMeta,
+) -> Result<OwnerReference, Error> {
+    Ok(OwnerReference {
+        api_version: K::api_version(&()).to_string(),
+        kind: K::kind(&()).to_string(),
+        name: meta.name.ok_or(Error::MissingObjectKey {
+            name: ".metadata.name",
+        })?,
+        uid: meta.uid.ok_or(Error::MissingObjectKey {
+            name: ".metadata.uid",
+        })?,
+        ..OwnerReference::default()
+    })
+}
+
 async fn create_pod(pods: Api<Pod>, job: Job) -> Result<(), Error> {
     let pod = Pod {
         metadata: ObjectMeta {
             namespace: job.metadata.namespace.clone(),
-            name: job.metadata.name.clone(),
+            name: Some(create_tmp_pod_name(job.metadata.name.as_ref().unwrap())),
+            owner_references: Some(vec![object_to_owner_reference::<Job>(job.metadata)?]),
             ..Default::default()
         },
         spec: Some(PodSpec {
@@ -82,9 +104,22 @@ async fn create_pod(pods: Api<Pod>, job: Job) -> Result<(), Error> {
         status: None,
     };
     let pp = PostParams::default();
+
     match pods.create(&pp, &pod).await {
         Ok(_) => Ok(()),
         Err(e) => Err(Error::KubeError(e)),
+    }
+}
+
+fn create_tmp_pod_name(s: &str) -> String {
+    let rand_string: String = thread_rng()
+        .sample_iter(&Alphanumeric)
+        .take(6)
+        .map(char::from)
+        .collect();
+    let rand_string = rand_string.to_lowercase();
+    match s.len() {
+        _ => format!("{}-{}", s, rand_string),
     }
 }
 

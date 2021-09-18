@@ -35,3 +35,4 @@ opentelemetry = { version = "0.16.0", features = ["trace", "rt-tokio"] }
 opentelemetry-otlp = { version = "0.9.0", features = ["tokio"], optional = true }
 prometheus = "0.12.0"
 tonic = { version = "0.5.2", optional = true }
+rand = "0.8.4"
