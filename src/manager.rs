@@ -43,8 +43,17 @@ async fn reconcile(job: Job, ctx: Context<Data>) -> Result<ReconcilerAction, Err
     let lp = ListParams::default();
     match pods.list(&lp).await {
         Ok(pod_list) => {
-            for pod in pod_list {
-                let container = &pod.spec.unwrap().containers[0];
+            let job_uid = job.metadata.uid.as_ref().unwrap();
+            let owned_pods = pod_list.iter().filter(|pod| {
+                pod.metadata
+                    .owner_references
+                    .as_ref()
+                    .unwrap_or(&vec![])
+                    .iter()
+                    .any(|or| &or.uid == job_uid)
+            });
+            for pod in owned_pods {
+                let container = &pod.spec.as_ref().unwrap().containers[0];
                 if container.name == job.spec.name
                     && container.image.as_ref().unwrap() == &job.spec.image
                 {
@@ -53,7 +62,7 @@ async fn reconcile(job: Job, ctx: Context<Data>) -> Result<ReconcilerAction, Err
                     });
                 }
                 let dp = DeleteParams::default();
-                pods.delete(&pod.metadata.name.unwrap(), &dp)
+                pods.delete(&pod.metadata.name.as_ref().unwrap(), &dp)
                     .await
                     .or_else(|e| Err(Error::KubeError(e)))?;
             }
